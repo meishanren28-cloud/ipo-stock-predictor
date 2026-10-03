@@ -32,6 +32,40 @@ from ocr_utils import extract_fields, run_ocr
 
 DATA = ROOT / "data"
 
+
+# Built-in verified akippa fallback. This prevents the app from crashing if
+# data/verified_627A.csv or data/akippa_metadata.json are missing after a cloud redeploy.
+_BUILTIN_AKIPPA_ROWS = [
+    ("2026-09-18", 1244, 1315, 1019, 1037, 12872700),
+    ("2026-09-24", 995, 1337, 989, 1337, 10680200),
+    ("2026-09-25", 1367, 1637, 1350, 1637, 27485000),
+    ("2026-09-28", 1837, 2037, 1800, 2037, 8642700),
+    ("2026-09-29", 2238, 2507, 2024, 2105, 40989800),
+    ("2026-09-30", 2250, 2379, 2016, 2041, 35229300),
+    ("2026-10-01", 1911, 1953, 1682, 1745, 10505600),
+    ("2026-10-02", 1750, 1967, 1750, 1778, 11148400),
+]
+_BUILTIN_AKIPPA_META = {
+    "code": "627A",
+    "company": "akippa株式会社",
+    "listing_date": "2026-09-18",
+    "market": "スタンダード",
+    "offer_price": 570,
+    "listing_shares": 6262140,
+    "industry": "情報・通信業",
+}
+
+def safe_load_verified_627a(data_dir):
+    try:
+        return load_verified_627a(data_dir)
+    except (FileNotFoundError, OSError):
+        hist = pd.DataFrame(
+            _BUILTIN_AKIPPA_ROWS,
+            columns=["Date", "Open", "High", "Low", "Close", "Volume"],
+        )
+        hist["Date"] = pd.to_datetime(hist["Date"])
+        return hist, dict(_BUILTIN_AKIPPA_META)
+
 st.set_page_config(page_title="日本IPO相似案例预测", page_icon="📈", layout="wide")
 
 
@@ -97,7 +131,7 @@ def build_public_cache(start_year: int = 2018):
 
 def fetch_target_history(code: str, listing_date: pd.Timestamp, lookahead_days=180) -> pd.DataFrame:
     if code.upper() == "627A":
-        h, _ = load_verified_627a(DATA)
+        h, _ = safe_load_verified_627a(DATA)
         return h[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
     try:
         import yfinance as yf
@@ -216,7 +250,7 @@ with left:
     if not master.empty and code in set(master["code"].astype(str)):
         meta_row = master[master["code"].astype(str).eq(code)].sort_values("listing_date").iloc[-1]
     if code == "627A":
-        _, ak_meta = load_verified_627a(DATA)
+        _, ak_meta = safe_load_verified_627a(DATA)
         listing_default = pd.Timestamp(ak_meta["listing_date"]).date()
         offer_default = float(ak_meta["offer_price"])
         market_default = ak_meta["market"]
