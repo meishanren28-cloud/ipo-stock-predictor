@@ -4,6 +4,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from io import StringIO
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -96,7 +97,7 @@ def discover_jpx_archive_urls(timeout: int = 20) -> list[str]:
     try:
         r = requests.get(JPX_NEW, headers=UA, timeout=timeout)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup.find_all(["a", "option"]):
             href = tag.get("href") or tag.get("value")
             if href and "00-archives-" in href:
@@ -114,7 +115,7 @@ def discover_jpx_archive_urls(timeout: int = 20) -> list[str]:
 def _extract_ipo_table(url: str, timeout: int = 25) -> pd.DataFrame:
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
-    tables = pd.read_html(r.text)
+    tables = pd.read_html(StringIO(r.text), flavor="bs4")
     best = None
     best_score = -1
     for t in tables:
@@ -145,7 +146,7 @@ def _fallback_parse_jpx_rows(url: str, start_year: int, end_year: int, timeout: 
     out = []
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, "html.parser")
     for tr in soup.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
         if not cells:
