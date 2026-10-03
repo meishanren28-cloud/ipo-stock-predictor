@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -21,7 +22,14 @@ from data_sources import (
     load_verified_627a,
     validate_ohlcv,
 )
-from features import build_training_samples, state_row_from_inputs
+from features import (
+    PEER_FEATURES,
+    add_peer_context_features,
+    apply_live_peer_context,
+    build_training_samples,
+    compute_state_features,
+    state_row_from_inputs,
+)
 from modeling import (
     empirical_touch_probabilities,
     forecast,
@@ -29,7 +37,11 @@ from modeling import (
     similar_case_distribution,
 )
 from ocr_utils import extract_fields, run_ocr
-from backtesting import walk_forward_backtest
+from backtesting import (
+    build_touch_calibrator,
+    quantile_bias_corrections,
+    walk_forward_backtest,
+)
 
 DATA = ROOT / "data"
 
@@ -78,6 +90,11 @@ def load_cache():
     manifest_path = DATA / "manifest.json"
     master = pd.read_csv(master_path, parse_dates=["listing_date"]) if master_path.exists() else pd.DataFrame()
     samples = pd.read_parquet(samples_path) if samples_path.exists() else pd.DataFrame()
+    if not samples.empty:
+        # Backward-compatible upgrade: old training parquet files do not contain
+        # peer-context columns. They can be derived from the same-date state rows
+        # without re-downloading market data.
+        samples = add_peer_context_features(samples)
     quality = pd.read_csv(quality_path) if quality_path.exists() else pd.DataFrame()
     manifest = {}
     if manifest_path.exists():
@@ -87,6 +104,95 @@ def load_cache():
         if c in samples.columns:
             samples[c] = pd.to_datetime(samples[c])
     return master, samples, quality, manifest
+
+
+@st.cache_data(show_spinner=False)
+def load_daily_cache():
+    path = DATA / "ipo_daily.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.upper()
+    return df
+
+
+def live_peer_states(daily: pd.DataFrame, master: pd.DataFrame, asof_date, max_state_day: int = 35) -> pd.DataFrame:
+    """Build contemporaneous IPO states for the target trading date.
+
+    Only data on or before `asof_date` are used. We keep IPOs within their first
+    `max_state_day` trading days so the peer environment matches the training cohort.
+    """
+    if daily.empty or master.empty:
+        return pd.DataFrame()
+    asof = pd.Timestamp(asof_date).normalize()
+    d = daily.copy()
+    d = d[pd.to_datetime(d["Date"], errors="coerce").dt.normalize() <= asof]
+    if d.empty:
+        return pd.DataFrame()
+    m = master.copy()
+    m["code"] = m["code"].astype(str).str.upper()
+    m["listing_date"] = pd.to_datetime(m["listing_date"], errors="coerce").dt.normalize()
+    # A generous calendar window; trading-day count below is the real filter.
+    m = m[(m["listing_date"] <= asof) & (m["listing_date"] >= asof - pd.Timedelta(days=90))]
+    m = m.sort_values("listing_date").drop_duplicates("code", keep="last")
+    meta = m.set_index("code") if not m.empty else pd.DataFrame()
+    rows = []
+    for code, g in d[d["code"].isin(set(m["code"]))].groupby("code"):
+        g = g.sort_values("Date").reset_index(drop=True)
+        if len(g) < 4 or len(g) > max_state_day:
+            continue
+        # The peer must have a bar on the same target date, otherwise we would be
+        # comparing stale states from a different session.
+        if pd.Timestamp(g["Date"].iloc[-1]).normalize() != asof:
+            continue
+        if code not in meta.index:
+            continue
+        mr = meta.loc[code]
+        if isinstance(mr, pd.DataFrame):
+            mr = mr.iloc[-1]
+        offer = mr.get("offer_price")
+        offer = None if pd.isna(offer) or float(offer or 0) <= 0 else float(offer)
+        try:
+            feats = compute_state_features(g[["Date", "Open", "High", "Low", "Close", "Volume"]], offer_price=offer)
+        except Exception:
+            continue
+        rows.append({
+            "code": str(code),
+            "asof_date": asof,
+            "listing_date": pd.Timestamp(mr["listing_date"]),
+            "market": str(mr.get("market", "")),
+            "offer_price": offer,
+            **feats,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_backtest_calibration(bundle, bt):
+    """Bias-correct live quantiles using strict out-of-sample residuals."""
+    if bt is None or getattr(bt, "horizon", None) != bundle.horizon:
+        return bundle
+    corr = quantile_bias_corrections(bt)
+    if not corr:
+        return bundle
+    highs = {}
+    lows = {}
+    for q in (0.1, 0.5, 0.9):
+        hret = bundle.high_quantiles[q] / bundle.current_price - 1
+        lret = bundle.low_quantiles[q] / bundle.current_price - 1
+        hret += corr.get(f"high_q{int(q*100)}", 0.0)
+        lret += corr.get(f"low_q{int(q*100)}", 0.0)
+        highs[q] = bundle.current_price * (1 + hret)
+        lows[q] = bundle.current_price * (1 + lret)
+    hs = np.sort([highs[q] for q in (0.1, 0.5, 0.9)])
+    ls = np.sort([lows[q] for q in (0.1, 0.5, 0.9)])
+    highs = dict(zip((0.1, 0.5, 0.9), hs))
+    lows = dict(zip((0.1, 0.5, 0.9), ls))
+    cret = bundle.close_median / bundle.current_price - 1
+    cret += corr.get("close_q50", 0.0)
+    return replace(bundle, high_quantiles=highs, low_quantiles=lows, close_median=bundle.current_price * (1 + cret))
 
 
 @st.cache_data(show_spinner=False)
@@ -196,6 +302,7 @@ def build_public_cache(start_year: int = 2018):
     with open(DATA / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     load_cache.clear()
+    load_daily_cache.clear()
     status.update(label="历史库建立完成", state="complete", expanded=False)
     return manifest
 
@@ -264,6 +371,7 @@ st.title("📈 日本IPO相似案例 + 概率预测")
 st.caption("不是“猜一个神奇最高点”：用历史相似IPO + 分位数机器学习，输出未来1/3/5个交易日的价格区间与关键价位触及概率。")
 
 master, samples, quality, manifest = load_cache()
+daily_prices = load_daily_cache()
 
 with st.sidebar:
     st.header("数据状态")
@@ -294,6 +402,7 @@ with st.sidebar:
     st.write("• 历史OHLCV：公开Yahoo Finance，逐只做OHLC一致性检查")
     st.write("• 627A内置8日数据已用株探/みんかぶ交叉核验")
     st.write("• 日线无法知道当天最高/最低发生顺序")
+    st.write("• 模型加入同一交易日其他新股的相对强弱/量价环境")
 
 if samples.empty:
     st.info("先在左侧点击“建立/更新公开历史库”。部署到有互联网的 Streamlit Cloud 后可直接建立。项目也附带命令行构建脚本。")
@@ -387,6 +496,7 @@ with right:
     horizon = st.radio("预测窗口", [1, 3, 5], horizontal=True, format_func=lambda x: f"未来{x}个交易日")
     n_neighbors = st.slider("参考最相似案例数", 15, 80, 40, 5)
     extra_levels = st.text_input("其他关键价位（逗号分隔）", value="1650,1700,1900,2000,2100,2300")
+    compare_codes_text = st.text_input("额外对比股票代码（可选，逗号分隔）", value="", help="只用于结果页横向检查；真正进入模型的是自动计算的同期IPO整体环境，避免人为挑选样本。")
 
     run = st.button("开始预测", type="primary", use_container_width=True)
 
@@ -404,8 +514,16 @@ with st.expander("🧪 模型体检：严格样本外回测 / 分位数校准", 
     bt = st.session_state.get("last_backtest")
     if bt is not None and getattr(bt, "horizon", None) == int(horizon):
         render_backtest(bt)
-    elif bt is not None:
-        st.info("你改了预测窗口，请重新运行一次严格回测。")
+        use_calibration = st.checkbox(
+            "用这次样本外回测结果校准最终区间与触及概率",
+            value=True,
+            help="用历史闭卷考试暴露出的系统偏差修正当前预测；不是用周一结果反改周一预测。",
+        )
+    else:
+        use_calibration = False
+        if bt is not None:
+            st.info("你改了预测窗口，请重新运行一次严格回测。")
+        st.caption("回测尚未运行时，最终结果使用原始模型概率；跑完体检后可开启自动校准。")
 
 if run:
     if len(hist2) < 4:
@@ -423,13 +541,41 @@ if run:
             listing_date=pd.Timestamp(listing_date),
             market=market,
         )
-        bundle = forecast(samples, state, current_price=float(close_v), horizon=int(horizon), n_neighbors=int(n_neighbors))
+        peer_pool = live_peer_states(daily_prices, master, snap_date, max_state_day=35)
+        state = apply_live_peer_context(state, peer_pool)
+        raw_bundle = forecast(samples, state, current_price=float(close_v), horizon=int(horizon), n_neighbors=int(n_neighbors))
+
+        calibration_bt = st.session_state.get("last_backtest")
+        calibration_ok = bool(
+            use_calibration
+            and calibration_bt is not None
+            and getattr(calibration_bt, "horizon", None) == int(horizon)
+        )
+        probability_calibrator = build_touch_calibrator(calibration_bt) if calibration_ok else None
+        bundle = apply_backtest_calibration(raw_bundle, calibration_bt) if calibration_ok else raw_bundle
     except Exception as e:
         st.error(f"模型无法运行：{e}")
         st.stop()
 
     st.divider()
     st.header(f"{code} 模型结果 — 未来 {horizon} 个交易日")
+    if calibration_ok:
+        st.success("当前结果已使用严格样本外回测做历史偏差校准。")
+    else:
+        st.caption("当前结果为原始模型输出；运行上方严格回测后，可以启用历史偏差校准。")
+
+    peer_count = max(len(peer_pool), 0) if 'peer_pool' in locals() else 0
+    if peer_count >= 1 and pd.notna(state.iloc[0].get("peer_median_ret_1d", np.nan)):
+        target_rel = state.iloc[0].get("rel_ret_1d_peer", np.nan)
+        peer_med = state.iloc[0].get("peer_median_ret_1d", np.nan)
+        peer_up = state.iloc[0].get("peer_up_share_1d", np.nan)
+        st.caption(
+            f"同期IPO环境已进入模型：约 {peer_count + 1} 个当日新股状态；"
+            f"同期1日收益中位数 {peer_med:+.1%}，目标股相对同期 {target_rel:+.1%}，"
+            f"同期上涨占比 {peer_up:.0%}。"
+        )
+    else:
+        st.caption("当前未取得足够的同日IPO横向状态；横向特征将按缺失值处理，基础日线/量价模型仍可运行。")
 
     q1, q2, q3, q4 = st.columns(4)
     q1.metric("最低价 P50", f"{bundle.low_quantiles[0.5]:.0f}")
@@ -461,12 +607,26 @@ if run:
             pass
     levels = sorted(set(float(x) for x in levels if x and x > 0))
     probs = empirical_touch_probabilities(bundle.neighbors, float(close_v), int(horizon), levels)
-    probs["概率"] = probs["probability"].map(lambda x: f"{x:.1%}")
     probs["价位"] = probs["level"].round(0).astype(int)
-    st.subheader("关键价位触及概率（相似历史案例加权）")
-    st.dataframe(probs[["价位", "direction", "概率"]].rename(columns={"direction": "方向"}), use_container_width=True, hide_index=True)
+    if probability_calibrator is not None:
+        probs["raw_probability"] = probs["probability"]
+        probs["probability"] = probs["probability"].map(probability_calibrator)
+        probs["校准后概率"] = probs["probability"].map(lambda x: f"{x:.1%}")
+        probs["原始概率"] = probs["raw_probability"].map(lambda x: f"{x:.1%}")
+        st.subheader("关键价位触及概率（相似历史案例 + 样本外校准）")
+        st.dataframe(
+            probs[["价位", "direction", "校准后概率", "原始概率"]].rename(columns={"direction": "方向"}),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        probs["概率"] = probs["probability"].map(lambda x: f"{x:.1%}")
+        st.subheader("关键价位触及概率（相似历史案例加权）")
+        st.dataframe(probs[["价位", "direction", "概率"]].rename(columns={"direction": "方向"}), use_container_width=True, hide_index=True)
 
-    action = model_action(bundle, sell_level, buyback_level, int(shares_for_t))
+    action = model_action(
+        bundle, sell_level, buyback_level, int(shares_for_t),
+        probability_calibrator=probability_calibrator,
+    )
     st.subheader("模型动作")
     st.info(f"**{action['action']}**  ｜  置信度：{action['confidence']}")
     for reason in action["reasons"]:
@@ -480,7 +640,7 @@ if run:
             spread = (sell_level - buyback_level) * shares_for_t
             st.write(f"若实际完成 {sell_level:.0f} → {buyback_level:.0f} 的完整价差，理论价差贡献约 **{spread:,.0f} 円**（未计费用/税，且日线无法证明先后顺序）。")
 
-    tab1, tab2, tab3 = st.tabs(["最相似历史案例", "模型质量", "数据来源/限制"])
+    tab1, tab2, tab3, tab4 = st.tabs(["最相似历史案例", "模型质量", "横向量价对比", "数据来源/限制"])
     with tab1:
         n = bundle.neighbors.copy()
         if not master.empty:
@@ -519,6 +679,70 @@ if run:
             st.warning("你当前使用盘中未完成K线；这里的历史验证是收盘日线，因此实盘置信度应低于表内回测。")
 
     with tab3:
+        st.write("**自动进入模型的横向信息：** 同一交易日、上市初期IPO的涨跌、回撤、振幅和量能相对强弱。不是简单比较绝对成交量。")
+        peer_cols = [
+            ("peer_median_ret_1d", "同期1日收益中位数"),
+            ("rel_ret_1d_peer", "目标相对同期1日强弱"),
+            ("peer_up_share_1d", "同期上涨占比"),
+            ("peer_median_drawdown", "同期距高点回撤中位数"),
+            ("rel_drawdown_peer", "目标相对同期回撤强弱"),
+            ("peer_median_volume5", "同期量/5日均量中位数"),
+            ("rel_volume5_peer", "目标相对同期量能"),
+        ]
+        diag = []
+        for col, label in peer_cols:
+            val = state.iloc[0].get(col, np.nan)
+            if pd.notna(val):
+                diag.append({"横向特征": label, "数值": float(val)})
+        if diag:
+            dd = pd.DataFrame(diag)
+            def _fmt_peer(row):
+                if "量/5日均量" in row["横向特征"] or "相对同期量能" in row["横向特征"]:
+                    return f"{row['数值']:.2f}"
+                return f"{row['数值']:.1%}"
+            dd["值"] = dd.apply(_fmt_peer, axis=1)
+            st.dataframe(dd[["横向特征", "值"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("这次没有足够的同期IPO数据，模型已自动回退到基础特征。")
+
+        compare_codes = []
+        for tok in compare_codes_text.replace("，", ",").split(","):
+            ccode = tok.strip().upper()
+            if ccode and ccode != code and ccode not in compare_codes:
+                compare_codes.append(ccode)
+        if compare_codes:
+            rows = []
+            target_feats = compute_state_features(hist2, offer_price=offer_price if offer_price > 0 else None)
+            rows.append({"代码": code, "1日涨跌": target_feats.get("ret_1d"), "3日涨跌": target_feats.get("ret_3d"), "距高点回撤": target_feats.get("drawdown_from_peak"), "量/5日均量": target_feats.get("volume_to_mean5"), "日内振幅": target_feats.get("range_pct")})
+            for ccode in compare_codes:
+                mr = master[master["code"].astype(str).str.upper().eq(ccode)] if not master.empty else pd.DataFrame()
+                if mr.empty:
+                    continue
+                mr = mr.sort_values("listing_date").iloc[-1]
+                ch = fetch_target_history(ccode, pd.Timestamp(mr["listing_date"]))
+                if ch.empty:
+                    continue
+                ch = ch[pd.to_datetime(ch["Date"]).dt.tz_localize(None).dt.normalize() <= pd.Timestamp(snap_date).normalize()]
+                if len(ch) < 2:
+                    continue
+                off = mr.get("offer_price")
+                off = None if pd.isna(off) or float(off or 0) <= 0 else float(off)
+                try:
+                    cf = compute_state_features(ch, offer_price=off)
+                except Exception:
+                    continue
+                rows.append({"代码": ccode, "1日涨跌": cf.get("ret_1d"), "3日涨跌": cf.get("ret_3d"), "距高点回撤": cf.get("drawdown_from_peak"), "量/5日均量": cf.get("volume_to_mean5"), "日内振幅": cf.get("range_pct")})
+            if len(rows) > 1:
+                comp = pd.DataFrame(rows)
+                for c in ["1日涨跌", "3日涨跌", "距高点回撤", "日内振幅"]:
+                    comp[c] = comp[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}")
+                comp["量/5日均量"] = comp["量/5日均量"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}x")
+                st.markdown("**你指定的股票横向检查（不直接改模型权重）：**")
+                st.dataframe(comp, use_container_width=True, hide_index=True)
+            else:
+                st.caption("指定的对比股票未取得足够日线数据。")
+
+    with tab4:
         st.write("**上市元数据：** JPX 新规上场公司档案。")
         st.write("**历史价格：** Yahoo Finance（通过 yfinance）公开日线；每只股票需通过OHLC包络、正价格、成交量、上市日期滞后等检查才进入训练。")
         st.write("**627A：** 工具内置截至2026-10-02的8根已交叉核验日线。")

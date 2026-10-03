@@ -229,6 +229,7 @@ def model_action(
     sell_level: float | None,
     buyback_level: float | None,
     shares_for_t: int,
+    probability_calibrator=None,
 ) -> dict[str, Any]:
     """Translate model output into a transparent, non-execution decision aid.
 
@@ -246,9 +247,13 @@ def model_action(
     if sell_level:
         r = probs[probs["level"].eq(float(sell_level))]
         p_sell = float(r["probability"].iloc[0]) if not r.empty else None
+        if p_sell is not None and probability_calibrator is not None:
+            p_sell = float(probability_calibrator(p_sell))
     if buyback_level:
         r = probs[probs["level"].eq(float(buyback_level))]
         p_buy = float(r["probability"].iloc[0]) if not r.empty else None
+        if p_buy is not None and probability_calibrator is not None:
+            p_buy = float(probability_calibrator(p_buy))
 
     # Additional upside threshold: +8% above the user's sell level, used to
     # quantify sell-too-early risk rather than hiding it.
@@ -257,6 +262,8 @@ def model_action(
         extra = sell_level * 1.08
         tmp = empirical_touch_probabilities(neighbors, bundle.current_price, bundle.horizon, [extra])
         p_blowthrough = float(tmp["probability"].iloc[0])
+        if probability_calibrator is not None:
+            p_blowthrough = float(probability_calibrator(p_blowthrough))
 
     reasons = []
     if p_sell is not None:

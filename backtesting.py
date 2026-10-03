@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from sklearn.isotonic import IsotonicRegression
 
 from features import FEATURES
 from modeling import _fit_quantile_model, _numeric_matrix
@@ -275,3 +276,53 @@ def walk_forward_backtest(
         touch_calibration=touch_cal,
         touch_raw=touch_raw,
     )
+
+
+
+def build_touch_calibrator(result: BacktestResult):
+    """Return a probability mapping learned only from out-of-sample touch predictions.
+
+    This calibrator does not create predictive power by itself; it corrects systematic
+    over/under-confidence such as a model whose nominal 60% events historically occur
+    only 48% of the time.
+    """
+    raw = result.touch_raw.copy()
+    if raw.empty or len(raw) < 50:
+        return lambda p: float(np.clip(p, 0.0, 1.0))
+    x = pd.to_numeric(raw["predicted_probability"], errors="coerce")
+    y = pd.to_numeric(raw["actual_hit"], errors="coerce")
+    ok = x.notna() & y.notna()
+    x = x[ok].to_numpy(float)
+    y = y[ok].to_numpy(float)
+    if len(x) < 50 or len(np.unique(np.round(x, 4))) < 5:
+        return lambda p: float(np.clip(p, 0.0, 1.0))
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(x, y)
+    return lambda p: float(np.clip(iso.predict([float(p)])[0], 0.0, 1.0))
+
+
+def quantile_bias_corrections(result: BacktestResult) -> dict[str, float]:
+    """Estimate additive return corrections for live quantiles from OOS residuals.
+
+    For a q-quantile prediction Pq and actual return Y, c=quantile_q(Y-Pq) makes
+    Pq+c empirically closer to the desired coverage on the historical OOS set.
+    """
+    pred = result.predictions
+    out: dict[str, float] = {}
+    if pred.empty:
+        return out
+    for prefix, actual_col in [("high", "actual_high"), ("low", "actual_low")]:
+        for q in (0.1, 0.5, 0.9):
+            pc = f"{prefix}_q{int(q*100)}"
+            if pc not in pred.columns or actual_col not in pred.columns:
+                continue
+            resid = pd.to_numeric(pred[actual_col], errors="coerce") - pd.to_numeric(pred[pc], errors="coerce")
+            resid = resid.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(resid) >= 30:
+                out[f"{prefix}_q{int(q*100)}"] = float(np.quantile(resid.to_numpy(float), q))
+    if "close_q50" in pred.columns and "actual_close" in pred.columns:
+        resid = pd.to_numeric(pred["actual_close"], errors="coerce") - pd.to_numeric(pred["close_q50"], errors="coerce")
+        resid = resid.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(resid) >= 30:
+            out["close_q50"] = float(np.median(resid.to_numpy(float)))
+    return out
