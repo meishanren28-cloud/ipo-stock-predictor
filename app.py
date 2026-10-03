@@ -29,6 +29,7 @@ from modeling import (
     similar_case_distribution,
 )
 from ocr_utils import extract_fields, run_ocr
+from backtesting import walk_forward_backtest
 
 DATA = ROOT / "data"
 
@@ -86,6 +87,76 @@ def load_cache():
         if c in samples.columns:
             samples[c] = pd.to_datetime(samples[c])
     return master, samples, quality, manifest
+
+
+@st.cache_data(show_spinner=False)
+def run_strict_backtest_cached(samples_df: pd.DataFrame, horizon: int, n_neighbors: int):
+    return walk_forward_backtest(
+        samples_df,
+        horizon=int(horizon),
+        n_neighbors=int(n_neighbors),
+        max_folds=5,
+    )
+
+
+def render_backtest(result):
+    st.markdown("**它怎么考试：** 每个测试年份只能使用该年1月1日以前的数据训练；测试IPO整只留出，绝不把同一只IPO的早期状态塞回训练集。")
+    folds = result.fold_summary.copy()
+    if not folds.empty:
+        folds["train_last_date"] = pd.to_datetime(folds["train_last_date"]).dt.strftime("%Y-%m-%d")
+        folds["test_first_listing"] = pd.to_datetime(folds["test_first_listing"]).dt.strftime("%Y-%m-%d")
+        folds = folds.rename(columns={
+            "test_year": "测试年份", "train_rows": "训练样本", "test_rows": "测试样本",
+            "test_ipos": "测试IPO数", "train_last_date": "训练数据最晚日期",
+            "test_first_listing": "测试IPO最早上市日",
+        })
+        st.dataframe(folds, use_container_width=True, hide_index=True)
+
+    q = result.quantile_summary.copy()
+    label_map = {"high": "未来最高", "low": "未来最低", "close": "未来收盘"}
+    q["对象"] = q["target"].map(label_map).fillna(q["target"])
+    q["指标"] = q["metric"].replace({
+        "P10 actual<=prediction": "P10 实际≤预测",
+        "P50 actual<=prediction": "P50 实际≤预测",
+        "P90 actual<=prediction": "P90 实际≤预测",
+        "P10-P90 interval coverage": "P10-P90 区间覆盖率",
+        "Mean P10-P90 width": "P10-P90 平均宽度（收益率）",
+        "Median prediction MAE": "中位预测 MAE（收益率）",
+    })
+    def fmt_expected(x):
+        return "—" if pd.isna(x) else f"{x:.1%}"
+    def fmt_actual(row):
+        if "宽度" in row["指标"] or "MAE" in row["指标"]:
+            return f"{row['actual']:.2%}"
+        return f"{row['actual']:.1%}"
+    q["理论值"] = q["expected"].map(fmt_expected)
+    q["实测值"] = q.apply(fmt_actual, axis=1)
+    q["偏差"] = q["error"].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+    st.subheader("分位数校准")
+    st.dataframe(q[["对象", "指标", "理论值", "实测值", "偏差"]], use_container_width=True, hide_index=True)
+
+    cal = result.touch_calibration.copy()
+    st.subheader("触及概率校准")
+    if cal.empty:
+        st.write("没有足够的触及概率回测结果。")
+    else:
+        cal["预测概率均值"] = cal["predicted_mean"].map(lambda x: f"{x:.1%}")
+        cal["实际发生率"] = cal["actual_rate"].map(lambda x: f"{x:.1%}")
+        cal["偏差"] = cal["gap"].map(lambda x: f"{x:+.1%}")
+        cal = cal.rename(columns={"probability_bin": "模型概率档", "count": "事件数"})
+        st.dataframe(cal[["模型概率档", "事件数", "预测概率均值", "实际发生率", "偏差"]], use_container_width=True, hide_index=True)
+        st.caption("例如模型经常报50%-60%的事件，如果实际发生率也接近50%-60%，说明‘55%’这个数字比较可信。")
+
+    # A compact verdict based only on calibration errors; no claim of profitability.
+    core = result.quantile_summary[result.quantile_summary["expected"].notna()].copy()
+    mean_abs_gap = float(core["error"].abs().mean()) if not core.empty else np.nan
+    if pd.notna(mean_abs_gap):
+        if mean_abs_gap <= 0.04:
+            st.success(f"分位数平均校准偏差约 {mean_abs_gap:.1%}：目前看校准较好。")
+        elif mean_abs_gap <= 0.08:
+            st.info(f"分位数平均校准偏差约 {mean_abs_gap:.1%}：可用，但仍有明显误差。")
+        else:
+            st.warning(f"分位数平均校准偏差约 {mean_abs_gap:.1%}：偏差较大，当前概率数字不宜过度相信。")
 
 
 def build_public_cache(start_year: int = 2018):
@@ -318,6 +389,23 @@ with right:
     extra_levels = st.text_input("其他关键价位（逗号分隔）", value="1650,1700,1900,2000,2100,2300")
 
     run = st.button("开始预测", type="primary", use_container_width=True)
+
+st.divider()
+with st.expander("🧪 模型体检：严格样本外回测 / 分位数校准", expanded=False):
+    st.write("这不会改历史数据，也不会改627A当前预测。它只是拿历史IPO做‘闭卷考试’，检查P10/P50/P90和触及概率是否名副其实。")
+    st.caption(f"当前将检查：未来 {horizon} 个交易日；相似案例数 {n_neighbors}。首次运行会训练多个历史年度折叠。")
+    if st.button("运行严格回测", key="run_strict_backtest", use_container_width=True):
+        try:
+            with st.spinner("正在做严格样本外回测…"):
+                bt = run_strict_backtest_cached(samples, int(horizon), int(n_neighbors))
+            st.session_state["last_backtest"] = bt
+        except Exception as e:
+            st.error(f"严格回测失败：{e}")
+    bt = st.session_state.get("last_backtest")
+    if bt is not None and getattr(bt, "horizon", None) == int(horizon):
+        render_backtest(bt)
+    elif bt is not None:
+        st.info("你改了预测窗口，请重新运行一次严格回测。")
 
 if run:
     if len(hist2) < 4:
