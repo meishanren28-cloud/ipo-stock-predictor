@@ -11,8 +11,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.data_sources import fetch_jpx_ipo_master, fetch_yahoo_history_for_ipos, validate_ohlcv
-from src.features import build_training_samples
+from data_sources import fetch_jpx_ipo_master, fetch_yahoo_history_for_ipos, validate_ohlcv
+from features import build_training_samples
 
 
 def main():

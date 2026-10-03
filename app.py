@@ -13,21 +13,22 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.data_sources import (
+from data_sources import (
     fetch_jpx_ipo_master,
     fetch_yahoo_history_for_ipos,
     load_verified_627a,
     validate_ohlcv,
 )
-from src.features import build_training_samples, state_row_from_inputs
-from src.modeling import (
+from features import build_training_samples, state_row_from_inputs
+from modeling import (
     empirical_touch_probabilities,
     forecast,
     model_action,
     similar_case_distribution,
 )
-from src.ocr_utils import extract_fields, run_ocr
+from ocr_utils import extract_fields, run_ocr
 
 DATA = ROOT / "data"
 

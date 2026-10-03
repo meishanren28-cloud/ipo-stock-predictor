@@ -12,7 +12,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from src.features import FEATURES
+from features import FEATURES
 
 try:
     from lightgbm import LGBMRegressor
