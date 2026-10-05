@@ -49,6 +49,11 @@ PEER_FEATURES = [
 
 FEATURES = BASE_FEATURES + PEER_FEATURES
 
+# Extra feature known only once the next session opening price (or a pre-open scenario) is available.
+# It is intentionally NOT part of FEATURES so the ordinary close-to-next-day model stays unchanged.
+OPEN_CONTEXT_FEATURE = "known_open_gap"
+OPEN_FEATURES = FEATURES + [OPEN_CONTEXT_FEATURE]
+
 
 def _safe_div(a, b, default=np.nan):
     try:
@@ -242,6 +247,23 @@ def build_training_samples(
                 "offer_price": offer,
                 **feats,
             }
+            # Next-session opening-conditioned targets. These let a second model answer:
+            # “given the opening price we now know, how far does the session usually travel?”
+            # They are computed from the very next daily bar and therefore can be used in strict
+            # walk-forward backtests without minute data.
+            nxt = g.iloc[t + 1]
+            nxt_open = float(nxt["Open"])
+            if nxt_open > 0:
+                row["next_open_gap_1d"] = float(nxt_open / cur_close - 1)
+                row["next_high_from_open_1d"] = float(float(nxt["High"]) / nxt_open - 1)
+                row["next_low_from_open_1d"] = float(float(nxt["Low"]) / nxt_open - 1)
+                row["next_close_from_open_1d"] = float(float(nxt["Close"]) / nxt_open - 1)
+            else:
+                row["next_open_gap_1d"] = np.nan
+                row["next_high_from_open_1d"] = np.nan
+                row["next_low_from_open_1d"] = np.nan
+                row["next_close_from_open_1d"] = np.nan
+
             for h in horizons:
                 fut = g.iloc[t + 1 : t + 1 + h]
                 row[f"future_max_ret_{h}d"] = float(fut["High"].max() / cur_close - 1)
@@ -275,3 +297,60 @@ def state_row_from_inputs(
     for c in PEER_FEATURES:
         row[c] = np.nan
     return pd.DataFrame([row])
+
+
+def add_open_conditioned_targets(samples: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible upgrade for an existing training_samples.parquet.
+
+    Older V2 caches contain the state features and close-anchored future targets but not
+    the next session's opening-conditioned targets. If ipo_daily.parquet is available,
+    derive those columns without re-downloading any data.
+    """
+    if samples.empty:
+        return samples.copy()
+    needed = [
+        "next_open_gap_1d",
+        "next_high_from_open_1d",
+        "next_low_from_open_1d",
+        "next_close_from_open_1d",
+    ]
+    if all(c in samples.columns for c in needed):
+        return samples.copy()
+    out = samples.copy()
+    for c in needed:
+        if c not in out.columns:
+            out[c] = np.nan
+    if prices is None or prices.empty or not {"code", "Date", "Open", "High", "Low", "Close"}.issubset(prices.columns):
+        return out
+
+    p = prices.copy()
+    p["code"] = p["code"].astype(str).str.upper()
+    p["Date"] = pd.to_datetime(p["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    for c in ["Open", "High", "Low", "Close"]:
+        p[c] = pd.to_numeric(p[c], errors="coerce")
+    p = p.dropna(subset=["code", "Date", "Open", "High", "Low", "Close"]).sort_values(["code", "Date"])
+    p["next_Date"] = p.groupby("code")["Date"].shift(-1)
+    for c in ["Open", "High", "Low", "Close"]:
+        p[f"next_{c}"] = p.groupby("code")[c].shift(-1)
+    lookup = p[["code", "Date", "Close", "next_Open", "next_High", "next_Low", "next_Close"]].copy()
+    lookup = lookup.rename(columns={"Date": "asof_date", "Close": "state_close"})
+
+    out["code"] = out["code"].astype(str).str.upper()
+    out["asof_date"] = pd.to_datetime(out["asof_date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    merged = out[["code", "asof_date"]].merge(lookup, on=["code", "asof_date"], how="left")
+    state_close = pd.to_numeric(merged["state_close"], errors="coerce")
+    nxt_open = pd.to_numeric(merged["next_Open"], errors="coerce")
+    valid = (state_close > 0) & (nxt_open > 0)
+    vals = {
+        "next_open_gap_1d": nxt_open / state_close - 1,
+        "next_high_from_open_1d": pd.to_numeric(merged["next_High"], errors="coerce") / nxt_open - 1,
+        "next_low_from_open_1d": pd.to_numeric(merged["next_Low"], errors="coerce") / nxt_open - 1,
+        "next_close_from_open_1d": pd.to_numeric(merged["next_Close"], errors="coerce") / nxt_open - 1,
+    }
+    for c, v in vals.items():
+        arr = v.where(valid).to_numpy()
+        existing = pd.to_numeric(out[c], errors="coerce").to_numpy()
+        fill = pd.isna(existing) & pd.notna(arr)
+        existing[fill] = arr[fill]
+        out[c] = existing
+    return out

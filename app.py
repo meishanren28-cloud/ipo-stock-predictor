@@ -14,15 +14,14 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "src"))
 
-from data_sources import (
+from src.data_sources import (
     fetch_jpx_ipo_master,
     fetch_yahoo_history_for_ipos,
     load_verified_627a,
     validate_ohlcv,
 )
-from features import (
+from v3_features import (
     PEER_FEATURES,
     OPEN_FEATURES,
     add_peer_context_features,
@@ -32,7 +31,7 @@ from features import (
     compute_state_features,
     state_row_from_inputs,
 )
-from modeling import (
+from v3_modeling import (
     empirical_touch_probabilities,
     forecast,
     model_action,
@@ -45,8 +44,8 @@ from modeling import (
     sell_then_buy_grid,
     condition_open_bundle_intraday,
 )
-from ocr_utils import extract_fields, run_ocr
-from backtesting import (
+from src.ocr_utils import extract_fields, run_ocr
+from v3_backtesting import (
     build_touch_calibrator,
     quantile_bias_corrections,
     walk_forward_backtest,

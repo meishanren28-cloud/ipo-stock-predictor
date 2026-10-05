@@ -1,0 +1,28 @@
+这版专门解决 Streamlit Cloud 的 ImportError / features.py 混版问题。
+
+关键设计：
+- 不再让 V3 app.py 从 src/features.py、src/modeling.py、src/backtesting.py 导入新功能。
+- V3 新功能使用根目录独立文件：
+  v3_features.py
+  v3_modeling.py
+  v3_backtesting.py
+- 原来的 src/ 整个目录可以保持你最新 V2 的原样，不用覆盖。
+
+最稳部署方法（推荐）：
+1. GitHub 仓库根目录上传/覆盖 app.py。
+2. 在同一个根目录新上传：v3_features.py、v3_modeling.py、v3_backtesting.py。
+3. 不要把这三个文件放进 src/。
+4. 确认 GitHub 根目录能同时看见：
+   app.py
+   v3_features.py
+   v3_modeling.py
+   v3_backtesting.py
+   src/
+5. 等 Streamlit 自动部署；若仍显示旧缓存，Manage app -> Reboot app。
+
+这版 app.py 第25行附近应该看到：
+from v3_features import (...)
+而不是：
+from features import (...)
+
+如果报错页面仍写 `from features import (`，说明 Streamlit 运行的仍是旧 app.py，GitHub 根目录 app.py 没有被这版覆盖成功。

@@ -183,22 +183,3 @@ ipo_stock_predictor/
 
 ## Strict out-of-sample backtest (added)
 Open **模型体检：严格样本外回测 / 分位数校准** in the Streamlit app. The test uses year-based walk-forward folds, keeps each test IPO entirely out of the training set, and forbids training dates from reaching into the test year. It reports P10/P50/P90 empirical coverage and calibration of nearest-neighbor touch probabilities.
-
-## V3：免费日线“预测大师”
-
-V3 在原有收盘后 1/3/5 日模型之外，新增一套**实际开盘价已知后的单日模型**。训练样本使用历史 IPO 的真实次日开盘跳空作为已知输入，预测相对开盘价的当日最高、最低和收盘，因此可以继续用免费日线做严格 walk-forward 回测。
-
-日常建议流程：
-
-- **收盘后**：先看原 V2 的下一日基础区间和关键价位概率。
-- **8:55 左右**：把气配输入“大师模式”，当成“如果按这个价开”的场景预案；因为免费历史库没有每天 8:55 气配，所以这一层只做情景推演。
-- **9:00 实际开盘后**：输入真实开盘价，再跑一次。这一层和历史训练口径一致，可信度最高。
-- **盘中**：可以继续输入当前价/当日高低，网页会标记推荐价位是否已经出现；但不会假装拥有历史分钟路径。
-
-“大师模式”会自动搜索买入价×卖出价网格，并把同日两价出现率拆成：
-
-- **顺序确定成功下界**：仅用日线也能证明买入后确实还有机会到卖价；
-- **两价同日出现上界**：高低都出现过，但日线无法确定先后；
-- **顺序未知部分**：上界减下界。
-
-这样既能最大化免费数据的价值，也不会为了给出一个漂亮“胜率”而伪造分钟级信息。
