@@ -1,0 +1,13 @@
+历史库建立失败修复（2026-10-05）
+
+错误：Cannot convert input [code 2022 ... Name: listing_date ... Series] to Timestamp
+
+原因：JPX备用HTML解析器把上市日期中的年份“2022”误认成了股票代码，导致同一个假代码对应几十个上市日期；后续代码把整列 Series 当成单个 Timestamp 转换，于是报错。
+
+处理：
+1. 备用解析器不再扫描整行找代码，而是逐单元格找证券代码并排除日期年份；
+2. 历史母表自动清除旧的“代码=上市年份”的错误fallback行；
+3. Yahoo下载阶段再次过滤旧缓存中的这类错误行；
+4. 同一年同代码先去重，避免 .loc 返回 Series。
+
+使用：只需把本包里的 data_sources.py 上传到 GitHub 仓库最外层，覆盖现有同名文件，然后 Commit changes。Streamlit 等自动重部署；若没有自动更新，再 Reboot app。无需改 app.py，也无需重新上传其他文件。

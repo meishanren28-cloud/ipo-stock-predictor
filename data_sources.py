@@ -135,6 +135,42 @@ def _extract_ipo_table(url: str, timeout: int = 25) -> pd.DataFrame:
 
 
 
+def _extract_code_from_cells(cells: list[str], listing_date: pd.Timestamp | None = None) -> tuple[str | None, int | None]:
+    """Extract a JPX security code from individual table cells.
+
+    Never scan the whole row at once: listing dates such as 2022-01-04 would
+    otherwise be misread as the security code ``2022``. Prefer cells whose
+    entire content is a 4-digit / 3-digit+letter code, then fall back to a
+    code-like token in a non-date cell.
+    """
+    listing_year = str(listing_date.year) if listing_date is not None else None
+
+    # First pass: exact code cell.
+    for i, cell in enumerate(cells):
+        raw = str(cell).strip().upper()
+        if not raw or parse_listing_date(raw) is not None:
+            continue
+        compact = re.sub(r"\s+", "", raw)
+        if re.fullmatch(r"(?:[0-9]{4}|[0-9]{3}[A-Z])", compact):
+            # In fallback parsing, a bare year is far more likely to be part of
+            # the listing date/header than a real security code.
+            if listing_year is not None and compact == listing_year:
+                continue
+            return compact, i
+
+    # Second pass: code token embedded in a non-date cell.
+    for i, cell in enumerate(cells):
+        raw = str(cell).strip()
+        if not raw or parse_listing_date(raw) is not None:
+            continue
+        code = normalize_code(raw)
+        if code is None:
+            continue
+        if listing_year is not None and code == listing_year:
+            continue
+        return code, i
+    return None, None
+
 
 def _fallback_parse_jpx_rows(url: str, start_year: int, end_year: int, timeout: int = 25) -> list[dict]:
     """Best-effort HTML row parser used if pandas cannot understand JPX headers.
@@ -153,12 +189,13 @@ def _fallback_parse_jpx_rows(url: str, start_year: int, end_year: int, timeout: 
             continue
         full = " | ".join(cells)
         dt = parse_listing_date(full)
-        code = normalize_code(full)
-        if dt is None or code is None or not (start_year <= dt.year <= end_year):
+        if dt is None or not (start_year <= dt.year <= end_year):
             continue
         if dt.date() > date.today():
             continue
-        code_idx = next((i for i,c in enumerate(cells) if normalize_code(c) == code), None)
+        code, code_idx = _extract_code_from_cells(cells, dt)
+        if code is None:
+            continue
         company = cells[code_idx-1] if code_idx is not None and code_idx > 0 else ""
         market = next((m for m in ["グロース", "スタンダード", "プライム", "Growth", "Standard", "Prime"] if m in full), "")
         out.append({
@@ -248,6 +285,18 @@ def fetch_jpx_ipo_master(start_year: int = 2018, end_year: int | None = None) ->
         raise RuntimeError("JPX IPO master could not be built. Check internet access / JPX page structure.")
 
     df = pd.DataFrame(rows)
+    df["listing_date"] = pd.to_datetime(df["listing_date"], errors="coerce")
+    df = df.dropna(subset=["listing_date", "code"]).copy()
+    df["code"] = df["code"].astype(str).str.strip().str.upper()
+
+    # Guard against a historical fallback-parser bug that could interpret the
+    # year in a date (e.g. 2022-01-04) as security code 2022. Only apply this
+    # filter to fallback-derived rows so a genuine code equal to a year is not
+    # discarded from a correctly parsed JPX table.
+    fallback = df["metadata_source"].astype(str).str.endswith("#fallback")
+    same_as_year = df["code"].eq(df["listing_date"].dt.year.astype(str))
+    df = df[~(fallback & same_as_year)].copy()
+
     df = df.sort_values(["listing_date", "code"]).drop_duplicates(["listing_date", "code"], keep="last")
     # Technical/transfer listings are poor comparables for an ordinary IPO. Keep
     # them in the master for transparency, but mark them for downstream filtering.
@@ -295,13 +344,39 @@ def fetch_yahoo_history_for_ipos(
 
     work = master.copy()
     work = work[(~work["is_technical"].fillna(False))].copy()
-    work["listing_year"] = pd.to_datetime(work["listing_date"]).dt.year
+    work["listing_date"] = pd.to_datetime(work["listing_date"], errors="coerce")
+    work = work.dropna(subset=["listing_date", "code"]).copy()
+    work["code"] = work["code"].astype(str).str.strip().str.upper()
+    work["listing_year"] = work["listing_date"].dt.year
+
+    # Also protect callers that pass an old cached master produced by the buggy
+    # fallback parser. A row where fallback code == listing year is invalid.
+    if "metadata_source" in work.columns:
+        bad_fallback_year = (
+            work["metadata_source"].astype(str).str.endswith("#fallback")
+            & work["code"].eq(work["listing_year"].astype("Int64").astype(str))
+        )
+        work = work[~bad_fallback_year].copy()
 
     for year, g in work.groupby("listing_year"):
+        year = int(year)
         year_start = pd.Timestamp(year=year, month=1, day=1)
         year_end = pd.Timestamp(year=year + 1, month=6, day=30)
-        codes = g["code"].astype(str).tolist()
-        by_code = g.set_index("code")
+
+        # Archive pages can overlap, and malformed source rows should never make
+        # ``.loc[code]`` return a Series. Keep one clean listing date per code.
+        g = g.copy()
+        g["code"] = g["code"].astype(str).str.strip().str.upper()
+        g["listing_date"] = pd.to_datetime(g["listing_date"], errors="coerce")
+        g = g.dropna(subset=["code", "listing_date"])
+        if "metadata_source" in g.columns:
+            g["_fallback"] = g["metadata_source"].astype(str).str.endswith("#fallback")
+            g = g.sort_values(["code", "_fallback", "listing_date"], ascending=[True, True, False])
+        else:
+            g = g.sort_values(["code", "listing_date"], ascending=[True, False])
+        g = g.drop_duplicates("code", keep="first")
+        codes = g["code"].tolist()
+        listing_by_code = g.set_index("code")["listing_date"].to_dict()
 
         for i in range(0, len(codes), batch_size):
             batch_codes = codes[i : i + batch_size]
@@ -321,7 +396,7 @@ def fetch_yahoo_history_for_ipos(
                 raw = pd.DataFrame()
 
             for code, ticker in zip(batch_codes, tickers):
-                listing_date = pd.Timestamp(by_code.loc[code, "listing_date"]).normalize()
+                listing_date = pd.Timestamp(listing_by_code[code]).normalize()
                 try:
                     if raw.empty:
                         raise ValueError("empty batch")
