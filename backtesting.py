@@ -9,8 +9,8 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.isotonic import IsotonicRegression
 
-from features import FEATURES
-from modeling import _fit_quantile_model, _numeric_matrix
+from features import FEATURES, OPEN_FEATURES
+from modeling import _fit_quantile_model, _numeric_matrix, _matrix_for
 
 
 @dataclass
@@ -326,3 +326,124 @@ def quantile_bias_corrections(result: BacktestResult) -> dict[str, float]:
         if len(resid) >= 30:
             out["close_q50"] = float(np.median(resid.to_numpy(float)))
     return out
+
+
+@dataclass
+class OpenBacktestResult:
+    """Strict walk-forward validation for the opening-conditioned one-day model."""
+    horizon: int
+    predictions: pd.DataFrame
+    quantile_summary: pd.DataFrame
+    fold_summary: pd.DataFrame
+    touch_calibration: pd.DataFrame
+    touch_raw: pd.DataFrame
+
+
+def _neighbor_open_touch_predictions(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    n_neighbors: int,
+    relative_levels: tuple[float, ...],
+) -> pd.DataFrame:
+    if train.empty or test.empty:
+        return pd.DataFrame()
+    tr = train.copy(); te = test.copy()
+    tr["known_open_gap"] = tr["next_open_gap_1d"]
+    te["known_open_gap"] = te["next_open_gap_1d"]
+    xt = _matrix_for(tr, OPEN_FEATURES)
+    xv = _matrix_for(te, OPEN_FEATURES)
+    imp = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+    train_z = scaler.fit_transform(imp.fit_transform(xt))
+    test_z = scaler.transform(imp.transform(xv))
+    n = min(int(n_neighbors), len(tr))
+    nn = NearestNeighbors(n_neighbors=n, metric="euclidean")
+    nn.fit(train_z)
+    dist, idx = nn.kneighbors(test_z)
+    max_ret = tr["next_high_from_open_1d"].to_numpy(float)
+    min_ret = tr["next_low_from_open_1d"].to_numpy(float)
+    actual_max = te["next_high_from_open_1d"].to_numpy(float)
+    actual_min = te["next_low_from_open_1d"].to_numpy(float)
+    rows = []
+    for i in range(len(te)):
+        d = dist[i]; ids = idx[i]
+        scale = max(float(np.median(d)), 1e-6)
+        w = np.exp(-0.5 * (d / scale) ** 2)
+        if w.sum() <= 0:
+            w = np.ones_like(w)
+        for r in relative_levels:
+            if r >= 0:
+                nh = max_ret[ids] >= r; ah = actual_max[i] >= r; direction = "up"
+            else:
+                nh = min_ret[ids] <= r; ah = actual_min[i] <= r; direction = "down"
+            rows.append({
+                "code": str(te.iloc[i]["code"]),
+                "asof_date": pd.Timestamp(te.iloc[i]["asof_date"]),
+                "relative_level": float(r),
+                "direction": direction,
+                "predicted_probability": float(np.average(nh.astype(float), weights=w)),
+                "actual_hit": int(ah),
+            })
+    return pd.DataFrame(rows)
+
+
+def walk_forward_open_backtest(
+    samples: pd.DataFrame,
+    n_neighbors: int = 40,
+    max_folds: int = 5,
+    relative_levels: tuple[float, ...] = (-0.10, -0.075, -0.05, -0.025, 0.025, 0.05, 0.075, 0.10),
+) -> OpenBacktestResult:
+    """Closed-book test of the model that receives the next real opening gap as input."""
+    targets = ["next_open_gap_1d", "next_high_from_open_1d", "next_low_from_open_1d", "next_close_from_open_1d"]
+    required = [*targets, "asof_date", "listing_date", "code", *FEATURES]
+    missing = [c for c in required if c not in samples.columns]
+    if missing:
+        raise ValueError(f"Open backtest missing columns: {missing[:6]}")
+    s = samples.dropna(subset=targets + ["asof_date", "listing_date"]).copy()
+    folds = _year_folds(s, max_folds=max_folds)
+    if not folds:
+        raise ValueError("Not enough dated IPO samples for opening-conditioned walk-forward folds.")
+    q_levels = (0.1, 0.5, 0.9)
+    pred_frames=[]; touch_frames=[]; fold_rows=[]
+    for test_year, train, test in folds:
+        tr=train.copy(); te=test.copy()
+        tr["known_open_gap"] = tr["next_open_gap_1d"]
+        te["known_open_gap"] = te["next_open_gap_1d"]
+        xt=_matrix_for(tr, OPEN_FEATURES); xv=_matrix_for(te, OPEN_FEATURES)
+        fold_pred=te[["code","asof_date","listing_date"]].copy().reset_index(drop=True)
+        for prefix,target in [("high","next_high_from_open_1d"),("low","next_low_from_open_1d")]:
+            pmat=[]
+            for q in q_levels:
+                model=_fit_quantile_model(xt,tr[target],q)
+                pmat.append(model.predict(xv))
+            pmat=_enforce_monotone(np.column_stack(pmat))
+            for j,q in enumerate(q_levels):
+                fold_pred[f"{prefix}_q{int(q*100)}"] = pmat[:,j]
+        cm=_fit_quantile_model(xt,tr["next_close_from_open_1d"],0.5)
+        fold_pred["close_q50"] = cm.predict(xv)
+        fold_pred["actual_high"] = te["next_high_from_open_1d"].to_numpy(float)
+        fold_pred["actual_low"] = te["next_low_from_open_1d"].to_numpy(float)
+        fold_pred["actual_close"] = te["next_close_from_open_1d"].to_numpy(float)
+        fold_pred["test_year"] = int(test_year)
+        pred_frames.append(fold_pred)
+        touch=_neighbor_open_touch_predictions(train,test.reset_index(drop=True),n_neighbors,relative_levels)
+        if not touch.empty:
+            touch["test_year"] = int(test_year); touch_frames.append(touch)
+        fold_rows.append({
+            "test_year":int(test_year), "train_rows":int(len(train)), "test_rows":int(len(test)),
+            "test_ipos":int(test["code"].astype(str).nunique()), "train_last_date":pd.Timestamp(train["asof_date"].max()),
+            "test_first_listing":pd.Timestamp(test["listing_date"].min()),
+        })
+    pred=pd.concat(pred_frames,ignore_index=True)
+    rows=[]; rows.extend(_quantile_metrics(pred,"high","actual_high")); rows.extend(_quantile_metrics(pred,"low","actual_low"))
+    close_cov=float(np.mean(pred["actual_close"].to_numpy(float) <= pred["close_q50"].to_numpy(float)))
+    close_mae=float(np.mean(np.abs(pred["actual_close"]-pred["close_q50"])))
+    rows.extend([
+        {"target":"close","metric":"P50 actual<=prediction","expected":0.5,"actual":close_cov,"error":close_cov-0.5},
+        {"target":"close","metric":"Median prediction MAE","expected":np.nan,"actual":close_mae,"error":np.nan},
+    ])
+    touch_raw=pd.concat(touch_frames,ignore_index=True) if touch_frames else pd.DataFrame()
+    return OpenBacktestResult(
+        horizon=1, predictions=pred, quantile_summary=pd.DataFrame(rows), fold_summary=pd.DataFrame(fold_rows),
+        touch_calibration=_calibration_bins(touch_raw), touch_raw=touch_raw,
+    )

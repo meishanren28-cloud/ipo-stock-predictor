@@ -24,7 +24,9 @@ from data_sources import (
 )
 from features import (
     PEER_FEATURES,
+    OPEN_FEATURES,
     add_peer_context_features,
+    add_open_conditioned_targets,
     apply_live_peer_context,
     build_training_samples,
     compute_state_features,
@@ -35,12 +37,20 @@ from modeling import (
     forecast,
     model_action,
     similar_case_distribution,
+    open_forecast,
+    open_touch_probabilities,
+    neighbor_quality,
+    optimize_trade_grid,
+    select_master_plans,
+    sell_then_buy_grid,
+    condition_open_bundle_intraday,
 )
 from ocr_utils import extract_fields, run_ocr
 from backtesting import (
     build_touch_calibrator,
     quantile_bias_corrections,
     walk_forward_backtest,
+    walk_forward_open_backtest,
 )
 
 DATA = ROOT / "data"
@@ -202,6 +212,39 @@ def run_strict_backtest_cached(samples_df: pd.DataFrame, horizon: int, n_neighbo
         horizon=int(horizon),
         n_neighbors=int(n_neighbors),
         max_folds=5,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def run_open_backtest_cached(samples_df: pd.DataFrame, n_neighbors: int):
+    return walk_forward_open_backtest(
+        samples_df,
+        n_neighbors=int(n_neighbors),
+        max_folds=5,
+    )
+
+
+def apply_open_backtest_calibration(bundle, bt):
+    """Bias-correct opening-conditioned quantiles using strict OOS residuals."""
+    if bt is None:
+        return bundle
+    corr = quantile_bias_corrections(bt)
+    if not corr:
+        return bundle
+    highs = {}; lows = {}
+    for q in (0.1, 0.5, 0.9):
+        hret = bundle.high_quantiles[q] / bundle.open_price - 1 + corr.get(f"high_q{int(q*100)}", 0.0)
+        lret = bundle.low_quantiles[q] / bundle.open_price - 1 + corr.get(f"low_q{int(q*100)}", 0.0)
+        highs[q] = bundle.open_price * (1 + hret)
+        lows[q] = bundle.open_price * (1 + lret)
+    hs = np.sort([highs[q] for q in (0.1, 0.5, 0.9)])
+    ls = np.sort([lows[q] for q in (0.1, 0.5, 0.9)])
+    cret = bundle.close_median / bundle.open_price - 1 + corr.get("close_q50", 0.0)
+    return replace(
+        bundle,
+        high_quantiles=dict(zip((0.1, 0.5, 0.9), hs)),
+        low_quantiles=dict(zip((0.1, 0.5, 0.9), ls)),
+        close_median=bundle.open_price * (1 + cret),
     )
 
 
@@ -367,11 +410,121 @@ def forecast_band_chart(bundle):
     return fig
 
 
-st.title("📈 日本IPO相似案例 + 概率预测")
-st.caption("不是“猜一个神奇最高点”：用历史相似IPO + 分位数机器学习，输出未来1/3/5个交易日的价格区间与关键价位触及概率。")
+def render_master_plan(open_bundle, shares: int, price_step: float, probability_calibrator=None, stage: str = "实际开盘", current_price: float | None = None, observed_high: float | None = None, observed_low: float | None = None, master_levels: list[float] | None = None):
+    st.header("🎯 大师模式：开盘价已知后的当日计划")
+    if stage.startswith("盘前"):
+        st.warning("盘前气配只作为‘如果按这个价开盘’的场景输入。历史库没有每天8:55气配，因此真正严格回测的是实际开盘价模式。")
+    elif stage.startswith("盘中"):
+        st.info("盘中更新会用实际开盘模型做底座，并标记今天已经触及的价位；当前价的分钟级路径本身没有被伪装成历史分钟回测。")
+    else:
+        st.success("实际开盘模式：开盘跳空幅度与历史训练口径一致，可做严格样本外检验。")
+
+    quality = neighbor_quality(open_bundle.neighbors, feature_count=len(OPEN_FEATURES))
+    a,b,c,d,e = st.columns(5)
+    a.metric("开盘/场景价", f"{open_bundle.open_price:.0f}", f"{open_bundle.open_gap:+.1%} vs 前收")
+    b.metric("最低 P50", f"{open_bundle.low_quantiles[0.5]:.0f}")
+    c.metric("最高 P50", f"{open_bundle.high_quantiles[0.5]:.0f}")
+    d.metric("收盘 P50", f"{open_bundle.close_median:.0f}")
+    e.metric("相似度", quality["grade"], f"有效N≈{quality['effective_n']:.1f}")
+    st.caption(
+        f"近邻{quality['count']}个；高度接近（每特征标准化RMS≤0.75）{quality['strong_count']}个；"
+        f"最近距离RMS≈{quality['nearest_rms_z']:.2f}。相似度低时，模型会显示数字但不应把它当成高把握。"
+    )
+
+    qdf = pd.DataFrame({
+        "分位": ["P10", "P50", "P90"],
+        "当日最低": [open_bundle.low_quantiles[q] for q in (0.1,0.5,0.9)],
+        "当日最高": [open_bundle.high_quantiles[q] for q in (0.1,0.5,0.9)],
+    }).round(0)
+    st.dataframe(qdf, use_container_width=True, hide_index=True)
+
+    grid = optimize_trade_grid(open_bundle, shares=int(shares), price_step=float(price_step))
+    picks = select_master_plans(grid)
+    st.subheader("买低 → 卖高：模型自动搜价")
+    if picks.get("首选") is None:
+        st.warning("模型没有找到‘风险调整分为正’的首选组合：默认结论是今天不强行做。下方如果仍有激进方案，只代表存在高风险候选，不代表推荐。")
+    rows=[]
+    for label in ["稳健","首选","激进"]:
+        r=picks.get(label)
+        if not r: continue
+        rows.append({
+            "方案":label, "买入":round(r["buy"]), "卖出":round(r["sell"]),
+            "买点触达":r["p_buy"], "两价同日出现":r["success_upper"],
+            "可由日线确定成功":r["success_lower"], "顺序未知部分":r["sequence_unknown"],
+            "买后再下5%风险":r["p_downside_5pct"],
+            "风险调整分/100股" if int(shares)==100 else f"风险调整分/{int(shares)}股":r["expected_conservative_yen"],
+        })
+    if rows:
+        show=pd.DataFrame(rows)
+        for col in ["买点触达","两价同日出现","可由日线确定成功","顺序未知部分","买后再下5%风险"]:
+            show[col]=show[col].map(lambda x:f"{x:.1%}")
+        exp_col=[c for c in show.columns if c.startswith("风险调整分/")][0]
+        show[exp_col]=show[exp_col].map(lambda x:f"{x:,.0f}")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("‘可由日线确定成功’是下界；‘两价同日出现’是上界。真正的先买后卖成功率位于两者之间。风险调整分用于排序（价差收益减去5%不利波动惩罚），不是承诺收益。")
+    else:
+        st.warning("当前相似案例没有形成足够可用的买低→卖高组合。今天可以选择不做。")
+
+    st.subheader("已有底仓：卖高 → 回补")
+    sg=sell_then_buy_grid(open_bundle, shares=int(shares), price_step=float(price_step))
+    if not sg.empty:
+        ss=sg.head(5).copy()
+        ss=ss.rename(columns={"sell":"卖出","buyback":"回补","p_sell":"卖价触达","p_buyback":"回补价触达","success_lower":"顺序确定成功下界","success_upper":"两价同日出现上界","p_blowthrough_5pct":"卖价再上5%概率"})
+        for col in ["卖价触达","回补价触达","顺序确定成功下界","两价同日出现上界","卖价再上5%概率"]:
+            ss[col]=ss[col].map(lambda x:f"{x:.1%}")
+        st.dataframe(ss[["卖出","回补","卖价触达","回补价触达","顺序确定成功下界","两价同日出现上界","卖价再上5%概率"]], use_container_width=True, hide_index=True)
+    else:
+        st.caption("当前没有通过最低筛选条件的卖出→回补组合。")
+
+    levels=list(master_levels or [])
+    if rows:
+        for r in picks.values():
+            if r:
+                levels.extend([r["buy"],r["sell"]])
+    levels=sorted(set(float(x) for x in levels if x and x>0))
+    if levels:
+        tp=open_touch_probabilities(open_bundle, levels, probability_calibrator=probability_calibrator)
+        if not tp.empty:
+            tp["价位"]=tp["level"].round(0).astype(int); tp["概率"]=tp["probability"].map(lambda x:f"{x:.1%}")
+            st.subheader("开盘条件下的关键价位触达概率")
+            st.dataframe(tp[["价位","direction","概率"]].rename(columns={"direction":"方向"}),use_container_width=True,hide_index=True)
+
+    if stage.startswith("盘中") and current_price and current_price>0:
+        st.subheader("盘中状态")
+        st.write(f"当前价 **{current_price:.0f}**；截至目前高 **{observed_high:.0f}** / 低 **{observed_low:.0f}**。")
+        main=picks.get("首选")
+        if main:
+            buy_touched = observed_low is not None and observed_low <= main["buy"]
+            sell_seen = observed_high is not None and observed_high >= main["sell"]
+            st.write(f"首选买点 {main['buy']:.0f}：{'已触及' if buy_touched else '未触及'}；卖点 {main['sell']:.0f}：{'盘中出现过' if sell_seen else '尚未出现'}。")
+            if buy_touched and sell_seen:
+                st.caption("两价今天都出现过，但没有分钟顺序数据时仍不能自动断言‘买入后又卖出’已经成立。")
+
+    with st.expander("查看开盘条件下最相似的历史IPO案例", expanded=False):
+        n=open_bundle.neighbors.head(20).copy()
+        if not n.empty:
+            n["相当低点"]=open_bundle.open_price*(1+n["next_low_from_open_1d"])
+            n["相当高点"]=open_bundle.open_price*(1+n["next_high_from_open_1d"])
+            n["相当收盘"]=open_bundle.open_price*(1+n["next_close_from_open_1d"])
+            cols=[c for c in ["code","listing_date","asof_date","distance","weight","next_open_gap_1d","相当低点","相当高点","相当收盘"] if c in n.columns]
+            z=n[cols].copy()
+            if "next_open_gap_1d" in z: z["next_open_gap_1d"]=z["next_open_gap_1d"].map(lambda x:f"{x:+.1%}")
+            if "distance" in z: z["distance"]=z["distance"].round(2)
+            if "weight" in z: z["weight"]=z["weight"].round(3)
+            for c in ["相当低点","相当高点","相当收盘"]:
+                if c in z: z[c]=z[c].round(0).astype(int)
+            st.dataframe(z,use_container_width=True,hide_index=True)
+
+
+st.title("📈 日本IPO预测大师 V3（免费日线版）")
+st.caption("保留V2基础模型，并新增：盘前气配场景 / 实际开盘条件模型 / 自动买卖价网格 / 相似案例可信度 / 严格样本外开盘回测。无需付费分钟行情。")
 
 master, samples, quality, manifest = load_cache()
 daily_prices = load_daily_cache()
+# V3 backward-compatible upgrade: derive opening-conditioned one-day targets from
+# the already cached free daily bars. No paid minute feed and no re-download required.
+if not samples.empty:
+    samples = add_open_conditioned_targets(samples, daily_prices)
 
 with st.sidebar:
     st.header("数据状态")
@@ -498,6 +651,24 @@ with right:
     extra_levels = st.text_input("其他关键价位（逗号分隔）", value="1650,1700,1900,2000,2100,2300")
     compare_codes_text = st.text_input("额外对比股票代码（可选，逗号分隔）", value="", help="只用于结果页横向检查；真正进入模型的是自动计算的同期IPO整体环境，避免人为挑选样本。")
 
+    st.divider()
+    st.markdown("**🎯 大师模式（免费日线版）**")
+    master_enabled = st.checkbox("启用开盘大师", value=True, help="用历史IPO的真实开盘价作为条件，重新计算当日高低区间并自动搜索买卖组合。")
+    master_stage = st.radio(
+        "输入时点",
+        ["盘前气配/预计开盘", "实际开盘", "盘中更新"],
+        horizontal=False,
+        index=0,
+        disabled=not master_enabled,
+    )
+    auto_open_default = float(open_v if intraday and open_v > 0 else close_v if close_v > 0 else 0.0)
+    master_open_price = st.number_input(
+        "下一/当前交易日的气配或实际开盘价",
+        min_value=0.0, value=auto_open_default, step=1.0, disabled=not master_enabled,
+        help="盘前填8:55附近气配；开盘后填实际始值。实际开盘模式的历史口径最可靠。",
+    )
+    master_price_step = st.number_input("自动搜价步长", min_value=1.0, max_value=100.0, value=10.0, step=1.0, disabled=not master_enabled)
+
     run = st.button("开始预测", type="primary", use_container_width=True)
 
 st.divider()
@@ -524,6 +695,30 @@ with st.expander("🧪 模型体检：严格样本外回测 / 分位数校准", 
         if bt is not None:
             st.info("你改了预测窗口，请重新运行一次严格回测。")
         st.caption("回测尚未运行时，最终结果使用原始模型概率；跑完体检后可开启自动校准。")
+
+    st.divider()
+    st.markdown("**开盘大师闭卷考试（未来1日）**")
+    if all(c in samples.columns for c in ["next_open_gap_1d", "next_high_from_open_1d", "next_low_from_open_1d", "next_close_from_open_1d"]) and samples["next_open_gap_1d"].notna().sum() >= 250:
+        if st.button("运行开盘大师严格回测", key="run_open_backtest", use_container_width=True):
+            try:
+                with st.spinner("正在测试‘已知实际开盘价后’的模型…"):
+                    obt = run_open_backtest_cached(samples, int(n_neighbors))
+                st.session_state["last_open_backtest"] = obt
+            except Exception as e:
+                st.error(f"开盘大师回测失败：{e}")
+        obt = st.session_state.get("last_open_backtest")
+        if obt is not None:
+            render_backtest(obt)
+            use_open_calibration = st.checkbox(
+                "用开盘大师闭卷结果校准开盘区间/触价概率",
+                value=True, key="use_open_calibration",
+            )
+        else:
+            use_open_calibration = False
+            st.caption("跑完后可以看到实际开盘模式的P10/P50/P90与触价概率有没有名副其实。")
+    else:
+        use_open_calibration = False
+        st.info("当前缓存还没有足够的开盘目标列。重新建立一次历史库后，大师模式会自动得到这套严格回测。")
 
 if run:
     if len(hist2) < 4:
@@ -557,8 +752,76 @@ if run:
         st.error(f"模型无法运行：{e}")
         st.stop()
 
+    master_bundle = None
+    master_error = None
+    open_probability_calibrator = None
+    if master_enabled:
+        try:
+            # If the left side is a live intraday bar, the opening-conditioned model
+            # must use the previous completed session as its state, not today's unfinished bar.
+            master_hist = hist2.copy()
+            if intraday and not master_hist.empty:
+                last_d = pd.Timestamp(master_hist["Date"].iloc[-1]).normalize()
+                if last_d == pd.Timestamp(snap_date).normalize():
+                    master_hist = master_hist.iloc[:-1].copy()
+            if len(master_hist) < 4:
+                raise ValueError("开盘大师至少需要开盘前4根完整日线。")
+            previous_close = float(master_hist["Close"].iloc[-1])
+            actual_open_input = float(open_v) if intraday and open_v > 0 and master_stage in ["实际开盘", "盘中更新"] else float(master_open_price)
+            if actual_open_input <= 0:
+                raise ValueError("请填写气配/实际开盘价。")
+            master_state = state_row_from_inputs(
+                master_hist,
+                offer_price=offer_price if offer_price > 0 else None,
+                code=code, listing_date=pd.Timestamp(listing_date), market=market,
+            )
+            base_date = pd.Timestamp(master_hist["Date"].iloc[-1]).normalize()
+            master_peers = live_peer_states(daily_prices, master, base_date, max_state_day=35)
+            master_state = apply_live_peer_context(master_state, master_peers)
+            stage_mode = "preopen_scenario" if master_stage.startswith("盘前") else ("intraday" if master_stage.startswith("盘中") else "actual_open")
+            raw_open_bundle = open_forecast(
+                samples, master_state, previous_close=previous_close, open_price=actual_open_input,
+                n_neighbors=int(n_neighbors), mode=stage_mode,
+            )
+            open_bt = st.session_state.get("last_open_backtest")
+            open_cal_ok = bool(use_open_calibration and open_bt is not None)
+            if open_cal_ok:
+                open_probability_calibrator = build_touch_calibrator(open_bt)
+                master_bundle = apply_open_backtest_calibration(raw_open_bundle, open_bt)
+            else:
+                master_bundle = raw_open_bundle
+            if master_stage.startswith("盘中") and intraday and high_v > 0 and low_v > 0 and close_v > 0:
+                master_bundle = condition_open_bundle_intraday(
+                    master_bundle, current_price=float(close_v),
+                    observed_high=float(high_v), observed_low=float(low_v), min_neighbors=8,
+                )
+        except Exception as e:
+            master_error = str(e)
+
     st.divider()
-    st.header(f"{code} 模型结果 — 未来 {horizon} 个交易日")
+    if master_enabled:
+        if master_bundle is not None:
+            master_levels = [sell_level, buyback_level]
+            for token in extra_levels.replace("，", ",").split(","):
+                try:
+                    xv = float(token.strip())
+                    if xv > 0:
+                        master_levels.append(xv)
+                except Exception:
+                    pass
+            render_master_plan(
+                master_bundle, shares=max(int(shares_for_t), 100), price_step=float(master_price_step),
+                probability_calibrator=open_probability_calibrator, stage=master_stage,
+                current_price=float(close_v) if master_stage.startswith("盘中") else None,
+                observed_high=float(high_v) if master_stage.startswith("盘中") else None,
+                observed_low=float(low_v) if master_stage.startswith("盘中") else None,
+                master_levels=master_levels,
+            )
+        else:
+            st.warning(f"开盘大师暂时无法运行：{master_error}")
+
+    st.divider()
+    st.header(f"{code} 基础模型结果 — 未来 {horizon} 个交易日")
     if calibration_ok:
         st.success("当前结果已使用严格样本外回测做历史偏差校准。")
     else:

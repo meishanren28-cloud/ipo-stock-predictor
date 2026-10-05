@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.streamlit/secrets.toml
+data/ipo_master.csv
+data/ipo_daily.parquet
+data/training_samples.parquet
+data/quality_report.csv
+data/manifest.json

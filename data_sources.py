@@ -139,50 +139,27 @@ def _extract_ipo_table(url: str, timeout: int = 25) -> pd.DataFrame:
 def _fallback_parse_jpx_rows(url: str, start_year: int, end_year: int, timeout: int = 25) -> list[dict]:
     """Best-effort HTML row parser used if pandas cannot understand JPX headers.
 
-    Important: never search the whole row for a stock code. A listing date such
-    as 2022/01/04 contains a four-digit year that otherwise looks exactly like
-    a legacy TSE stock code. We therefore identify the date cell first, then
-    search *separate cells after it* for an exact code token.
+    It prioritizes date/code/company/market. Offer price is intentionally left
+    blank unless it can be identified unambiguously; missing metadata is safer
+    than a wrongly assigned number.
     """
     out = []
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    code_re = re.compile(r"^(?:[0-9]{4}|[0-9]{3}[A-Z])$")
-
     for tr in soup.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
         if not cells:
             continue
-
-        # Find the actual listing-date cell rather than parsing the whole row.
-        date_idx = None
-        dt = None
-        for i, cell in enumerate(cells):
-            parsed = parse_listing_date(cell)
-            if parsed is not None:
-                date_idx, dt = i, parsed
-                break
-        if dt is None or not (start_year <= dt.year <= end_year) or dt.date() > date.today():
-            continue
-
-        # JPX rows place company/code near the listing date. Prefer the first
-        # exact code-looking cell after the date, which avoids mistaking the year
-        # or later numeric fields such as offer price/share counts for the code.
-        code_idx = None
-        code = None
-        scan = list(range(date_idx + 1, min(len(cells), date_idx + 5)))
-        scan += [i for i in range(len(cells)) if i not in scan and i != date_idx]
-        for i in scan:
-            token = str(cells[i]).strip().upper()
-            if code_re.fullmatch(token):
-                code_idx, code = i, token
-                break
-        if code is None:
-            continue
-
-        company = cells[code_idx - 1] if code_idx > 0 else ""
         full = " | ".join(cells)
+        dt = parse_listing_date(full)
+        code = normalize_code(full)
+        if dt is None or code is None or not (start_year <= dt.year <= end_year):
+            continue
+        if dt.date() > date.today():
+            continue
+        code_idx = next((i for i,c in enumerate(cells) if normalize_code(c) == code), None)
+        company = cells[code_idx-1] if code_idx is not None and code_idx > 0 else ""
         market = next((m for m in ["グロース", "スタンダード", "プライム", "Growth", "Standard", "Prime"] if m in full), "")
         out.append({
             "listing_date": dt.normalize(),
@@ -318,14 +295,7 @@ def fetch_yahoo_history_for_ipos(
 
     work = master.copy()
     work = work[(~work["is_technical"].fillna(False))].copy()
-    # A ticker can appear more than once in JPX archives (duplicate archive rows,
-    # transfers, relistings). For the post-IPO price fetch we need exactly one
-    # listing date per code; use the latest ordinary listing record.
-    work["listing_date"] = pd.to_datetime(work["listing_date"], errors="coerce")
-    work = work.dropna(subset=["listing_date", "code"])
-    work["code"] = work["code"].astype(str).str.strip().str.upper()
-    work = work.sort_values("listing_date").drop_duplicates("code", keep="last")
-    work["listing_year"] = work["listing_date"].dt.year
+    work["listing_year"] = pd.to_datetime(work["listing_date"]).dt.year
 
     for year, g in work.groupby("listing_year"):
         year_start = pd.Timestamp(year=year, month=1, day=1)
@@ -351,12 +321,7 @@ def fetch_yahoo_history_for_ipos(
                 raw = pd.DataFrame()
 
             for code, ticker in zip(batch_codes, tickers):
-                raw_listing_date = by_code.loc[code, "listing_date"]
-                # Defensive guard: even if an upstream page unexpectedly yields
-                # duplicate codes, never pass a whole Series into pd.Timestamp.
-                if isinstance(raw_listing_date, pd.Series):
-                    raw_listing_date = raw_listing_date.iloc[-1]
-                listing_date = pd.Timestamp(raw_listing_date).normalize()
+                listing_date = pd.Timestamp(by_code.loc[code, "listing_date"]).normalize()
                 try:
                     if raw.empty:
                         raise ValueError("empty batch")
