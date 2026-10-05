@@ -1,0 +1,13 @@
+V3 ImportError 修复包
+
+原因：GitHub/Streamlit 上的 app.py 已经是 V3，但 src/features.py（或 modeling.py/backtesting.py）仍是旧 V2，导致 app.py 导入 OPEN_FEATURES 等 V3 名称时失败。
+
+请把本压缩包里的文件按原路径覆盖到 GitHub 仓库根目录：
+- app.py
+- src/features.py
+- src/modeling.py
+- src/backtesting.py
+- scripts/build_history.py
+
+不要只替换 app.py；这几个文件必须保持同一版本。
+提交后 Streamlit 会自动重新部署。若仍显示旧错误，在 Streamlit Manage app 中 Reboot app。
